@@ -160,14 +160,14 @@ class TriSourceTwoOneDetector(RotatedBaseDetector):
         """Directly extract features from the backbone+neck."""
         x = self.backbone(batch_inputs, datasets)
         if isinstance(x, tuple) and len(x) ==2:
-            x, loss = x
+            x, aux_loss = x
             experts_id=None
         ###
         elif isinstance(x, tuple) and len(x) ==3:
-            x,loss,experts_id=x
+            x, aux_loss, experts_id = x
         ###
         else :
-            loss = None
+            aux_loss = None
             experts_id=None
         if self.with_neck:
             if len(datasets)>1:
@@ -187,7 +187,7 @@ class TriSourceTwoOneDetector(RotatedBaseDetector):
                     assert False, 'Invalid dataset'
 
         if is_train:
-            return x, loss
+            return x, aux_loss
         return x,experts_id
     
     def split_batch(self, x, is_list=False): 
@@ -264,10 +264,16 @@ class TriSourceTwoOneDetector(RotatedBaseDetector):
                 batch_inputs.append(img[each])
 
 
-        x, gate_loss = self.extract_feat(batch_inputs, self.train_datasets, is_train=True)
+        x, backbone_aux_loss = self.extract_feat(batch_inputs, self.train_datasets, is_train=True)
         losses = dict()
-        if gate_loss is not None:
-            losses.update({'gate_loss': gate_loss})
+        if backbone_aux_loss is not None:
+            # NOTE: SOFT MOE AUX LOSS ROUTING - Keep sparse and soft MoE aux
+            # losses out of the DSO task list by assigning explicit non-task keys.
+            if getattr(self.backbone, 'moe_type', 'sparse') == 'window_slot_soft_moe':
+                aux_loss_weight = getattr(self.backbone, 'soft_moe_cfg', {}).get('aux_loss_weight', 1.0)
+                losses.update({'loss_soft_moe_aux': backbone_aux_loss * aux_loss_weight})
+            else:
+                losses.update({'loss_moe_aux': backbone_aux_loss})
  
         sar_x, rgb_x, ifr_x = x
         

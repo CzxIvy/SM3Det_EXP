@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from copy import deepcopy
 from functools import partial
 from itertools import chain
 from typing import Sequence
@@ -25,6 +26,8 @@ import torch.nn as nn
 from ..builder import ROTATED_BACKBONES
 from mmcv.runner import BaseModule
 from timm.models.layers import DropPath, trunc_normal_
+
+from .window_slot_soft_moe import WindowSlotSoftMoE2D
 
 
 class LayerNorm2d(nn.LayerNorm):
@@ -247,6 +250,35 @@ class MoE_layer(nn.Module):
         # assert False, (y.shape, y[0][0][0])
         return y, loss
 
+
+def build_sparse_moe_cfg(noisy_gating, num_experts, top_k, gate, moe_cfg=None):
+    sparse_cfg = deepcopy(moe_cfg) if moe_cfg is not None else {}
+    sparse_cfg.setdefault('noisy_gating', noisy_gating)
+    sparse_cfg.setdefault('num_experts', num_experts)
+    sparse_cfg.setdefault('top_k', top_k)
+    sparse_cfg.setdefault('gating', gate)
+    return sparse_cfg
+
+
+def build_soft_moe_cfg(num_experts, soft_moe_cfg=None):
+    cfg = deepcopy(soft_moe_cfg) if soft_moe_cfg is not None else {}
+    cfg.setdefault('num_experts', num_experts)
+    cfg.setdefault('window_size', 7)
+    cfg.setdefault('hidden_ratio', 4)
+    cfg.setdefault('temperature', 1.0)
+    cfg.setdefault('residual_alpha_init', 0.0)
+    cfg.setdefault('use_shared_expert', True)
+    cfg.setdefault('drop', 0.0)
+    cfg.setdefault('act_layer', nn.GELU)
+    cfg.setdefault('aux_loss_weight', 0.01)
+    return cfg
+
+
+def average_aux_loss(aux_losses):
+    if len(aux_losses) == 0:
+        return None
+    return sum(aux_losses) / len(aux_losses)
+
 class SparseDispatcher(object):
     def __init__(self, num_experts, gates):
         self._gates = gates
@@ -300,7 +332,9 @@ class ConvNeXtBlock(BaseModule):
                  act_cfg=dict(type='GELU'),
                  mlp_ratio=4.,
                  linear_pw_conv=True,
+                 moe_type='sparse',
                  MoE_cfg=None,
+                 soft_moe_cfg=None,
                  drop_path_rate=0.,
                  layer_scale_init_value=1e-6,
                  use_grn=False,
@@ -318,15 +352,22 @@ class ConvNeXtBlock(BaseModule):
             pw_conv = nn.Linear
         else:
             pw_conv = partial(nn.Conv2d, kernel_size=1)
-        self.ffn = FFN(in_channels,mid_channels,pw_conv,act_cfg,use_grn)
 
-        self.MoE_cfg = MoE_cfg
-        if MoE_cfg is not None:
-            MoE_cfg.update({'in_channels': in_channels, 
-                'mid_channels': mid_channels, 
-                'pw_conv': pw_conv,'use_grn': use_grn, 
-                'act_cfg':act_cfg})
-            self.ffn = MoE_layer(MoE_cfg)
+        self.moe_type = moe_type if (MoE_cfg is not None or soft_moe_cfg is not None) else None
+        self.MoE_cfg = deepcopy(MoE_cfg) if MoE_cfg is not None else None
+        self.soft_moe_cfg = deepcopy(soft_moe_cfg) if soft_moe_cfg is not None else None
+        self.with_soft_moe = self.moe_type == 'window_slot_soft_moe'
+        if self.with_soft_moe:
+            soft_moe_cfg = deepcopy(self.soft_moe_cfg)
+            soft_moe_cfg.update({'dim': in_channels, 'act_layer': act_cfg})
+            self.ffn = WindowSlotSoftMoE2D(**soft_moe_cfg)
+        elif self.MoE_cfg is not None:
+            sparse_moe_cfg = deepcopy(self.MoE_cfg)
+            sparse_moe_cfg.update({'in_channels': in_channels,
+                'mid_channels': mid_channels,
+                'pw_conv': pw_conv, 'use_grn': use_grn,
+                'act_cfg': act_cfg})
+            self.ffn = MoE_layer(sparse_moe_cfg)
         else:
             self.ffn = FFN(in_channels,mid_channels,pw_conv,act_cfg,use_grn)
 
@@ -358,8 +399,14 @@ class ConvNeXtBlock(BaseModule):
                 x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
             else:
                 x = self.norm(x, data_format='channel_first')
-                if self.MoE_cfg is not None:
-                    
+                if self.with_soft_moe:
+                    # NOTE: SOFT MOE CHANNELS-LAST BRIDGE - The soft MoE module
+                    # keeps a [B, H, W, C] interface even if this block chooses
+                    # channel-first pointwise ops elsewhere in ConvNeXt.
+                    x = x.permute(0, 2, 3, 1).contiguous()
+                    x, loss = self.ffn(x)
+                    x = x.permute(0, 3, 1, 2).contiguous()
+                elif self.MoE_cfg is not None:
                     x,loss = self.ffn(x)
                 else: 
                     x = self.ffn(x)
@@ -465,6 +512,9 @@ class ConvNeXt_moe(BaseModule):
                  layer_scale_init_value=1e-6,
                  out_indices=[0, 1, 2, 3],
                  MoE_Block_inds = [[],[],[],[]],
+                 moe_type='sparse',
+                 MoE_cfg=None,
+                 soft_moe_cfg=None,
                  noisy_gating= True, 
                  num_experts= 2, 
                  gate= 'cosine', 
@@ -515,7 +565,23 @@ class ConvNeXt_moe(BaseModule):
                 assert out_indices[i] >= 0, f'Invalid out_indices {index}'
         self.out_indices = out_indices
         self.MoE_Block_inds = MoE_Block_inds
-        self.num_experts = num_experts
+        self.moe_type = moe_type
+        if self.moe_type not in ['sparse', 'window_slot_soft_moe']:
+            raise ValueError(f'Unsupported moe_type: {self.moe_type}')
+
+        # NOTE: SOFT MOE CONFIG COMPAT - Keep the original num_experts/top_k
+        # arguments working for sparse configs, while allowing newer MoE_cfg /
+        # soft_moe_cfg dictionaries to override or extend those defaults.
+        self.sparse_moe_cfg = build_sparse_moe_cfg(
+            noisy_gating=noisy_gating,
+            num_experts=num_experts,
+            top_k=top_k,
+            gate=gate,
+            moe_cfg=MoE_cfg)
+        self.num_experts = self.sparse_moe_cfg['num_experts']
+        self.soft_moe_cfg = build_soft_moe_cfg(
+            num_experts=self.num_experts,
+            soft_moe_cfg=soft_moe_cfg)
         self.frozen_stages = frozen_stages
         self.gap_before_final_norm = gap_before_final_norm
 
@@ -563,7 +629,9 @@ class ConvNeXt_moe(BaseModule):
                     drop_path_rate=dpr[block_idx + j],
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
-                    MoE_cfg = {'noisy_gating': noisy_gating, 'num_experts': num_experts, 'top_k': top_k, 'gating': gate} if j in MoE_Block_ind else None,
+                    moe_type=self.moe_type if j in MoE_Block_ind else None,
+                    MoE_cfg=deepcopy(self.sparse_moe_cfg) if j in MoE_Block_ind and self.moe_type == 'sparse' else None,
+                    soft_moe_cfg=deepcopy(self.soft_moe_cfg) if j in MoE_Block_ind and self.moe_type == 'window_slot_soft_moe' else None,
                     linear_pw_conv=linear_pw_conv,
                     layer_scale_init_value=layer_scale_init_value,
                     use_grn=use_grn,
@@ -581,13 +649,13 @@ class ConvNeXt_moe(BaseModule):
 
     def forward(self, x):
         outs = []
-        gate_losses = []
+        aux_losses = []
         for i, stage in enumerate(self.stages): 
             x = self.downsample_layers[i](x)
             for each_layer in stage:
-                x, gate_loss = each_layer(x)
-                if gate_loss is not None:
-                    gate_losses.append(gate_loss)  
+                x, aux_loss = each_layer(x)
+                if aux_loss is not None:
+                    aux_losses.append(aux_loss)
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
                 if self.gap_before_final_norm:
@@ -595,9 +663,32 @@ class ConvNeXt_moe(BaseModule):
                     outs.append(norm_layer(gap).flatten(1))
                 else:
                     outs.append(norm_layer(x))
-        if len(gate_losses) > 0:
-            return tuple(outs), sum(gate_losses)/len(gate_losses)
+        aux_loss = average_aux_loss(aux_losses)
+        if aux_loss is not None:
+            return tuple(outs), aux_loss
         return tuple(outs)
+
+    def _is_moe_block(self, stage_ind, blocks_ind):
+        return blocks_ind in self.MoE_Block_inds[stage_ind]
+
+    def _get_moe_pointwise_keys(self, key):
+        keys = []
+        for expert_idx in range(self.num_experts):
+            keys.append(
+                key.replace(
+                    'pointwise_conv',
+                    'ffn.experts.' + str(expert_idx) + '.pointwise_conv'))
+        if self.moe_type == 'window_slot_soft_moe' and self.soft_moe_cfg.get('use_shared_expert', True):
+            keys.append(key.replace('pointwise_conv', 'ffn.shared_expert.pointwise_conv'))
+        return keys
+
+    def _get_moe_grn_keys(self, key):
+        if self.moe_type == 'window_slot_soft_moe':
+            return []
+        keys = []
+        for expert_idx in range(self.num_experts):
+            keys.append(key.replace('grn', 'ffn.experts.' + str(expert_idx) + '.grn'))
+        return keys
 
     def _freeze_stages(self):
         for i in range(self.frozen_stages):
@@ -693,12 +784,13 @@ class ConvNeXt_moe(BaseModule):
                     k = k[9:]
                     if 'pointwise_conv' in k:
                         stage_splits = k.split('.') 
-                        stage_ind = eval(stage_splits[1])
-                        blocks_ind = eval(stage_splits[2]) 
-                        # if blocks_ind in [list(range(self.depth))[q] for q in self.MoE_Block_inds[stage_ind] if q < self.depth]:
-                        if blocks_ind in self.MoE_Block_inds[stage_ind]:
-                            for expert_idx in range(self.num_experts):
-                                new_k = k.replace('pointwise_conv', 'ffn.experts.'+str(expert_idx)+'.pointwise_conv')
+                        stage_ind = int(stage_splits[1])
+                        blocks_ind = int(stage_splits[2])
+                        if self._is_moe_block(stage_ind, blocks_ind):
+                            # NOTE: SOFT MOE PRETRAIN REMAP - Reuse the
+                            # pretrained ConvNeXt FFN weights for every expert,
+                            # and optionally for the shared expert path.
+                            for new_k in self._get_moe_pointwise_keys(k):
                                 state_dict[new_k] = v
                         else:
                             new_k = k.replace('pointwise_conv', 'ffn.pointwise_conv') 
@@ -706,11 +798,10 @@ class ConvNeXt_moe(BaseModule):
                     elif 'grn' in k:
                         
                         stage_splits = k.split('.') 
-                        stage_ind = eval(stage_splits[1])
-                        blocks_ind = eval(stage_splits[2]) 
-                        if blocks_ind in self.MoE_Block_inds[stage_ind]:
-                            for expert_idx in range(self.num_experts):
-                                new_k = k.replace('grn', 'ffn.experts.'+str(expert_idx)+'.grn')
+                        stage_ind = int(stage_splits[1])
+                        blocks_ind = int(stage_splits[2]) 
+                        if self._is_moe_block(stage_ind, blocks_ind):
+                            for new_k in self._get_moe_grn_keys(k):
                                 state_dict[new_k] = v
                         else:        
                             new_k = k.replace('grn', 'ffn.grn')
@@ -743,6 +834,9 @@ class ConvNeXt_moe_MultiInput(ConvNeXt_moe):
                  layer_scale_init_value=1e-6,
                  out_indices=[0, 1, 2, 3],
                  MoE_Block_inds = [[],[],[],[]],
+                 moe_type='sparse',
+                 MoE_cfg=None,
+                 soft_moe_cfg=None,
                  noisy_gating= True, 
                  num_experts= 2, 
                  top_k= 2,
@@ -762,6 +856,9 @@ class ConvNeXt_moe_MultiInput(ConvNeXt_moe):
                  ]):
         super().__init__(
                  MoE_Block_inds = MoE_Block_inds,
+                 moe_type=moe_type,
+                 MoE_cfg=MoE_cfg,
+                 soft_moe_cfg=soft_moe_cfg,
                  noisy_gating= noisy_gating, 
                  num_experts= num_experts, 
                  gate= gate, 
@@ -778,7 +875,8 @@ class ConvNeXt_moe_MultiInput(ConvNeXt_moe):
                  out_indices=out_indices,
                  frozen_stages=frozen_stages,
                  gap_before_final_norm=gap_before_final_norm,
-                 with_cp=with_cp,init_cfg=init_cfg)
+                 with_cp=with_cp,
+                 init_cfg=init_cfg)
   
         self.downsample_layers[0] = nn.Sequential(build_LayerNorm2d_layer(norm_cfg, self.channels[0]))
         
@@ -801,13 +899,13 @@ class ConvNeXt_moe_MultiInput(ConvNeXt_moe):
         batch_input = [self.dataset_stems['single'](x)]
         
         x = torch.cat(batch_input, dim=0)
-        gate_losses = []
+        aux_losses = []
         for i, stage in enumerate(self.stages): 
             x = self.downsample_layers[i](x)
             for each_layer in stage:
-                x, gate_loss = each_layer(x)
-                if gate_loss is not None:
-                    gate_losses.append(gate_loss)  
+                x, aux_loss = each_layer(x)
+                if aux_loss is not None:
+                    aux_losses.append(aux_loss)
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
                 if self.gap_before_final_norm:
@@ -815,8 +913,9 @@ class ConvNeXt_moe_MultiInput(ConvNeXt_moe):
                     outs.append(norm_layer(gap).flatten(1))
                 else:
                     outs.append(norm_layer(x))
-        if len(gate_losses) > 0:
-            return tuple(outs), sum(gate_losses)/len(gate_losses)
+        aux_loss = average_aux_loss(aux_losses)
+        if aux_loss is not None:
+            return tuple(outs), aux_loss
         return tuple(outs)
  
 
@@ -865,12 +964,10 @@ class ConvNeXt_moe_MultiInput(ConvNeXt_moe):
 
                     elif 'pointwise_conv' in k:
                         stage_splits = k.split('.') 
-                        stage_ind = eval(stage_splits[1])
-                        blocks_ind = eval(stage_splits[2]) 
-                        # if blocks_ind in [list(range(self.depth))[q] for q in self.MoE_Block_inds[stage_ind] if q < self.depth]:
-                        if blocks_ind in self.MoE_Block_inds[stage_ind]:
-                            for expert_idx in range(self.num_experts):
-                                new_k = k.replace('pointwise_conv', 'ffn.experts.'+str(expert_idx)+'.pointwise_conv')
+                        stage_ind = int(stage_splits[1])
+                        blocks_ind = int(stage_splits[2]) 
+                        if self._is_moe_block(stage_ind, blocks_ind):
+                            for new_k in self._get_moe_pointwise_keys(k):
                                 state_dict[new_k] = v
                         else:
                             new_k = k.replace('pointwise_conv', 'ffn.pointwise_conv') 
@@ -878,11 +975,10 @@ class ConvNeXt_moe_MultiInput(ConvNeXt_moe):
                     elif 'grn' in k:
                         
                         stage_splits = k.split('.') 
-                        stage_ind = eval(stage_splits[1])
-                        blocks_ind = eval(stage_splits[2]) 
-                        if blocks_ind in self.MoE_Block_inds[stage_ind]:
-                            for expert_idx in range(self.num_experts):
-                                new_k = k.replace('grn', 'ffn.experts.'+str(expert_idx)+'.grn')
+                        stage_ind = int(stage_splits[1])
+                        blocks_ind = int(stage_splits[2]) 
+                        if self._is_moe_block(stage_ind, blocks_ind):
+                            for new_k in self._get_moe_grn_keys(k):
                                 state_dict[new_k] = v
                         else:        
                             new_k = k.replace('grn', 'ffn.grn')
