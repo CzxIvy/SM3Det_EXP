@@ -1,0 +1,1 @@
+_base_ = ['../configs/M3ADet/M3ADet_convnext_t_micro_head.py']

@@ -34,6 +34,7 @@ class TriSourceDetector(RotatedBaseDetector):
     def __init__(self,
                  backbone,
                  neck=None,
+                 micro_head=None,
                  rgb_rpn_head=None,
                  rgb_roi_head=None,
                  rgb_train_cfg=None,
@@ -61,6 +62,12 @@ class TriSourceDetector(RotatedBaseDetector):
 
         if neck is not None:
             self.neck = build_neck(neck)
+
+        self.micro_head = None
+        if micro_head is not None:
+            micro_head_cfg = micro_head.copy()
+            if micro_head_cfg.pop('enable', False):
+                self.micro_head = build_head(micro_head_cfg)
 
         if rgb_rpn_head is not None:
             rgb_rpn_train_cfg = rgb_train_cfg.rpn if rgb_train_cfg is not None else None
@@ -204,6 +211,60 @@ class TriSourceDetector(RotatedBaseDetector):
                     gathered_info[namespace] = torch.stack(gathered_info[namespace]).cuda()
 
         return gathered_info
+
+    def _restore_feat_type(self, feat_type, feats):
+        if feat_type is tuple:
+            return tuple(feats)
+        return feats
+
+    def _infer_feat_strides(self, feats, batch_input_shape):
+        input_h, input_w = batch_input_shape
+        strides = []
+        for feat in feats:
+            stride_h = max(int(round(float(input_h) / float(feat.shape[-2]))), 1)
+            stride_w = max(int(round(float(input_w) / float(feat.shape[-1]))), 1)
+            strides.append(max(stride_h, stride_w))
+        return tuple(strides)
+
+    def _forward_micro_train(self,
+                             feats,
+                             gt_bboxes,
+                             gt_labels,
+                             img_metas,
+                             batch_input_shape,
+                             prefix):
+        if self.micro_head is None or len(gt_labels) == 0:
+            return feats, {}
+
+        feat_type = type(feats)
+        pred_dict = self.micro_head(feats)
+        enhanced_feats = self.micro_head.enhance_feats(feats, pred_dict)
+        feat_strides = self._infer_feat_strides(feats, batch_input_shape)
+        selected_strides = tuple(
+            feat_strides[level] for level in self.micro_head.feat_levels)
+        micro_losses = self.micro_head.loss(
+            pred_dict,
+            gt_bboxes,
+            gt_labels,
+            img_metas,
+            feat_strides=selected_strides)
+        micro_losses = {
+            f'{prefix}_{key}': value
+            for key, value in micro_losses.items()
+        }
+        return self._restore_feat_type(feat_type, enhanced_feats), micro_losses
+
+    def _forward_micro_test(self, feats):
+        if self.micro_head is None or not self.micro_head.use_inference_enhance:
+            return feats
+
+        feat_type = type(feats)
+        pred_dict = self.micro_head(feats)
+        enhanced_feats = self.micro_head.enhance_feats(
+            feats,
+            pred_dict,
+            enable=self.micro_head.use_inference_enhance)
+        return self._restore_feat_type(feat_type, enhanced_feats)
     
     def forward_dummy(self, img):
         """Used for computing network flops.
@@ -213,6 +274,7 @@ class TriSourceDetector(RotatedBaseDetector):
         outs = ()
         # backbone
         x,_ = self.extract_feat(img, ['rgb'])
+        x = self._forward_micro_test(x)
         rpn_outs = self.rgb_rpn_head(x)
         outs = outs + (rpn_outs, )
         proposals = torch.randn(1000, 5).to(img.device)
@@ -220,6 +282,7 @@ class TriSourceDetector(RotatedBaseDetector):
         outs = outs + (roi_outs, )
         
         x,_ = self.extract_feat(img, ['ifr'])
+        x = self._forward_micro_test(x)
         rpn_outs = self.ifr_rpn_head(x)
         outs = outs + (rpn_outs, )
         proposals = torch.randn(1000, 5).to(img.device)
@@ -227,6 +290,7 @@ class TriSourceDetector(RotatedBaseDetector):
         outs = outs + (roi_outs, )
 
         x,_ = self.extract_feat(img, ['sar'])
+        x = self._forward_micro_test(x)
        
         results = self.sar_bbox_head.forward(x)
         outs = outs + (results, )
@@ -288,6 +352,15 @@ class TriSourceDetector(RotatedBaseDetector):
             batch_input_shape = tuple(img['sar'][0].size()[-2:])
             for img_meta in sar_img_metas:
                 img_meta['batch_input_shape'] = batch_input_shape
+
+            sar_x, sar_micro_losses = self._forward_micro_train(
+                sar_x,
+                sar_gt_bboxes,
+                sar_gt_labels,
+                sar_img_metas,
+                batch_input_shape,
+                'sar')
+            losses.update(sar_micro_losses)
     
             single_stage_losses = self.sar_bbox_head.forward_train(sar_x, sar_img_metas, sar_gt_bboxes,
                                                 sar_gt_labels, gt_bboxes_ignore)
@@ -295,6 +368,19 @@ class TriSourceDetector(RotatedBaseDetector):
             losses.update({'sar_' + k: v for k, v in single_stage_losses.items()})
 
         if len(rgb_gt_labels) > 0:
+            batch_input_shape = tuple(img['rgb'][0].size()[-2:])
+            for img_meta in rgb_img_metas:
+                img_meta['batch_input_shape'] = batch_input_shape
+
+            rgb_x, rgb_micro_losses = self._forward_micro_train(
+                rgb_x,
+                rgb_gt_bboxes,
+                rgb_gt_labels,
+                rgb_img_metas,
+                batch_input_shape,
+                'rgb')
+            losses.update(rgb_micro_losses)
+
             if self.with_rgb_rpn:
                 proposal_cfg = self.rgb_train_cfg.get('rpn_proposal',
                                                 self.rgb_test_cfg.rpn)
@@ -317,6 +403,19 @@ class TriSourceDetector(RotatedBaseDetector):
             losses.update({'rgb_' + k: v for k, v in roi_losses.items()})
 
         if len(ifr_gt_labels) > 0:
+            batch_input_shape = tuple(img['ifr'][0].size()[-2:])
+            for img_meta in ifr_img_metas:
+                img_meta['batch_input_shape'] = batch_input_shape
+
+            ifr_x, ifr_micro_losses = self._forward_micro_train(
+                ifr_x,
+                ifr_gt_bboxes,
+                ifr_gt_labels,
+                ifr_img_metas,
+                batch_input_shape,
+                'ifr')
+            losses.update(ifr_micro_losses)
+
             if self.with_ifr_rpn:
                 proposal_cfg = self.ifr_train_cfg.get('rpn_proposal',
                                                 self.ifr_test_cfg.rpn)
@@ -386,6 +485,7 @@ class TriSourceDetector(RotatedBaseDetector):
             x,experts_id=x
         else:
             experts_id=None
+        x = self._forward_micro_test(x)
         if subdataset == 'sar':
 
             results_list = self.sar_bbox_head.simple_test(

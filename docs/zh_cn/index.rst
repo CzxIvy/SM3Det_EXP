@@ -9,6 +9,21 @@ Welcome to MMRotate's documentation!
 
 
 .. toctree::
+   :maxdepth: 1
+   :caption: 方法设计
+
+   soft_moe_micro_head_method.md
+
+
+.. toctree::
+   :maxdepth: 1
+   :caption: 实验与汇报
+
+   soft_moe_micro_head_experiments.md
+   soft_moe_micro_head_ppt_outline.md
+
+
+.. toctree::
    :maxdepth: 2
    :caption: 开始你的第一步
 

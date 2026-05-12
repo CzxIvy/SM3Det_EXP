@@ -1,0 +1,1 @@
+_base_ = ['../configs/SM3Det/SM3Det_convnext_t.py']

@@ -390,8 +390,9 @@ class ConvNeXtBlock(BaseModule):
             if self.linear_pw_conv:
                 x = x.permute(0, 2, 3, 1)  # (N, C, H, W) -> (N, H, W, C)
                 x = self.norm(x, data_format='channel_last')
-                if self.MoE_cfg is not None:
-                    
+                if self.with_soft_moe:
+                    x, loss = self.ffn(x)
+                elif self.MoE_cfg is not None:
                     x,loss = self.ffn(x)
                 else: 
                     x = self.ffn(x)
@@ -757,7 +758,7 @@ class ConvNeXt_moe(BaseModule):
             logger.warn(f'No pre-trained weights for '
                         f'{self.__class__.__name__}, '
                         f'training start from scratch')
-            if self.use_abs_pos_embed:
+            if getattr(self, 'use_abs_pos_embed', False):
                 trunc_normal_(self.absolute_pos_embed, std=0.02)
             for m in self.modules():
                 if isinstance(m, nn.Linear):
@@ -926,7 +927,7 @@ class ConvNeXt_moe_MultiInput(ConvNeXt_moe):
             logger.warn(f'No pre-trained weights for '
                         f'{self.__class__.__name__}, '
                         f'training start from scratch')
-            if self.use_abs_pos_embed:
+            if getattr(self, 'use_abs_pos_embed', False):
                 trunc_normal_(self.absolute_pos_embed, std=0.02)
             for m in self.modules():
                 if isinstance(m, nn.Linear):
